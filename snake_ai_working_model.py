@@ -3,8 +3,10 @@ import random
 import sys
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 import heapq
+import csv
+import statistics
 
 # ============================================================
 # Snake AI Working Model
@@ -28,6 +30,7 @@ GRID_HEIGHT = 24
 WIDTH = CELL_SIZE * GRID_WIDTH
 HEIGHT = CELL_SIZE * GRID_HEIGHT + 90
 FPS = 12
+BENCHMARK_RUNS = 5
 
 BG = (18, 18, 18)
 GRID = (35, 35, 35)
@@ -71,10 +74,28 @@ class Metrics:
     score: int = 0
     steps_survived: int = 0
     computation_ms: float = 0.0
+    total_decision_ms: float = 0.0
+    decisions_made: int = 0
+    max_snake_length: int = 3
+
+
+@dataclass
+class BenchmarkResult:
+    algorithm: str
+    run_number: int
+    score: int
+    steps_survived: int
+    foods_collected: int
+    avg_nodes_expanded: float
+    avg_decision_ms: float
+    max_snake_length: int
 
 
 class SnakeGame:
     def __init__(self):
+        self.benchmark_results = []
+        self.benchmark_summary = []
+        self.show_benchmark_overlay = False
         self.reset("human")
 
     def reset(self, mode="human"):
@@ -88,6 +109,7 @@ class SnakeGame:
         self.metrics = Metrics(algorithm=mode)
         self.cached_path = []
         self.last_reason = ""
+        self.metrics.max_snake_length = len(self.snake)
 
     def spawn_food(self):
         while True:
@@ -264,6 +286,8 @@ class SnakeGame:
         self.metrics.nodes_expanded = expanded
         self.metrics.last_path_length = max(0, len(path) - 1)
         self.metrics.computation_ms = (time.perf_counter() - start_time) * 1000
+        self.metrics.total_decision_ms += self.metrics.computation_ms
+        self.metrics.decisions_made += 1
         self.cached_path = path
 
         if len(path) >= 2:
@@ -317,6 +341,81 @@ class SnakeGame:
             self.snake.pop()
 
         self.metrics.steps_survived += 1
+        self.metrics.max_snake_length = max(self.metrics.max_snake_length, len(self.snake))
+
+    def run_single_algorithm_game(self, mode, seed=None, max_steps=1500):
+        if seed is not None:
+            random.seed(seed)
+        self.reset(mode)
+        while not self.game_over and self.metrics.steps_survived < max_steps:
+            self.step()
+
+        avg_nodes = 0.0
+        if self.metrics.decisions_made:
+            avg_nodes = self.metrics.nodes_expanded / 1.0
+        avg_decision_ms = 0.0
+        if self.metrics.decisions_made:
+            avg_decision_ms = self.metrics.total_decision_ms / self.metrics.decisions_made
+
+        return BenchmarkResult(
+            algorithm=mode,
+            run_number=0,
+            score=self.metrics.score,
+            steps_survived=self.metrics.steps_survived,
+            foods_collected=self.metrics.foods_collected,
+            avg_nodes_expanded=avg_nodes,
+            avg_decision_ms=avg_decision_ms,
+            max_snake_length=self.metrics.max_snake_length,
+        )
+
+    def run_benchmark(self, runs_per_algorithm=BENCHMARK_RUNS):
+        algorithms = ["bfs", "dfs", "greedy", "astar"]
+        self.benchmark_results = []
+        self.benchmark_summary = []
+        base_seed = int(time.time())
+
+        for algo in algorithms:
+            algo_runs = []
+            for run_idx in range(runs_per_algorithm):
+                result = self.run_single_algorithm_game(algo, seed=base_seed + run_idx)
+                result.run_number = run_idx + 1
+                algo_runs.append(result)
+                self.benchmark_results.append(result)
+
+            summary = {
+                "algorithm": algo,
+                "avg_score": round(statistics.mean(r.score for r in algo_runs), 2),
+                "avg_steps": round(statistics.mean(r.steps_survived for r in algo_runs), 2),
+                "avg_foods": round(statistics.mean(r.foods_collected for r in algo_runs), 2),
+                "avg_nodes": round(statistics.mean(r.avg_nodes_expanded for r in algo_runs), 2),
+                "avg_ms": round(statistics.mean(r.avg_decision_ms for r in algo_runs), 3),
+                "best_score": max(r.score for r in algo_runs),
+                "best_steps": max(r.steps_survived for r in algo_runs),
+            }
+            self.benchmark_summary.append(summary)
+
+        self.export_benchmark_csv()
+        self.show_benchmark_overlay = True
+        self.reset("human")
+
+    def export_benchmark_csv(self):
+        with open("snake_ai_benchmark_results.csv", "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "algorithm",
+                    "run_number",
+                    "score",
+                    "steps_survived",
+                    "foods_collected",
+                    "avg_nodes_expanded",
+                    "avg_decision_ms",
+                    "max_snake_length",
+                ],
+            )
+            writer.writeheader()
+            for result in self.benchmark_results:
+                writer.writerow(asdict(result))
 
     def handle_key(self, key):
         if key == pygame.K_UP:
@@ -339,6 +438,11 @@ class SnakeGame:
             self.reset("astar")
         elif key == pygame.K_r:
             self.reset(self.mode)
+            self.show_benchmark_overlay = False
+        elif key == pygame.K_b:
+            self.run_benchmark()
+        elif key == pygame.K_TAB:
+            self.show_benchmark_overlay = not self.show_benchmark_overlay
 
     def draw_grid(self):
         for x in range(0, WIDTH, CELL_SIZE):
@@ -353,6 +457,42 @@ class SnakeGame:
             rx = cell[0] * CELL_SIZE + 6
             ry = cell[1] * CELL_SIZE + 6
             pygame.draw.rect(screen, PATH_COLOR, (rx, ry, CELL_SIZE - 12, CELL_SIZE - 12), border_radius=6)
+
+    def draw_benchmark_overlay(self):
+        if not self.show_benchmark_overlay or not self.benchmark_summary:
+            return
+
+        overlay = pygame.Surface((WIDTH - 40, HEIGHT - 140), pygame.SRCALPHA)
+        overlay.fill((10, 10, 10, 235))
+        screen.blit(overlay, (20, 20))
+
+        title = font.render("Benchmark Results (saved to snake_ai_benchmark_results.csv)", True, TEXT)
+        screen.blit(title, (35, 35))
+
+        headers = ["Algo", "Avg Score", "Avg Steps", "Avg Foods", "Avg Nodes", "Avg ms", "Best Score"]
+        xs = [35, 120, 240, 360, 480, 600, 700]
+        for x, h in zip(xs, headers):
+            screen.blit(small_font.render(h, True, DANGER), (x, 80))
+
+        y = 115
+        for row in self.benchmark_summary:
+            values = [
+                row["algorithm"].upper(),
+                str(row["avg_score"]),
+                str(row["avg_steps"]),
+                str(row["avg_foods"]),
+                str(row["avg_nodes"]),
+                str(row["avg_ms"]),
+                str(row["best_score"]),
+            ]
+            for x, val in zip(xs, values):
+                screen.blit(small_font.render(val, True, TEXT), (x, y))
+            y += 32
+
+        footer1 = "B = run all algorithms | TAB = show/hide benchmark | CSV exported automatically"
+        footer2 = "Compare average score, survival, decision cost, and best run performance"
+        screen.blit(small_font.render(footer1, True, SUBTEXT), (35, HEIGHT - 165))
+        screen.blit(small_font.render(footer2, True, SUBTEXT), (35, HEIGHT - 140))
 
     def draw(self):
         screen.fill(BG)
@@ -372,7 +512,7 @@ class SnakeGame:
 
         line1 = f"Mode: {self.mode.upper()}    Score: {self.metrics.score}    Steps: {self.metrics.steps_survived}"
         line2 = f"PathLen: {self.metrics.last_path_length}    Nodes: {self.metrics.nodes_expanded}    Time: {self.metrics.computation_ms:.2f} ms"
-        line3 = "H Human | 1 BFS | 2 DFS | 3 Greedy | 4 A* | R Restart | ESC Quit"
+        line3 = "H Human | 1 BFS | 2 DFS | 3 Greedy | 4 A* | B Benchmark | TAB Results | R Restart | ESC Quit"
 
         screen.blit(font.render(line1, True, TEXT), (12, GRID_HEIGHT * CELL_SIZE + 10))
         screen.blit(small_font.render(line2, True, SUBTEXT), (12, GRID_HEIGHT * CELL_SIZE + 42))
@@ -389,6 +529,7 @@ class SnakeGame:
             screen.blit(msg_surface, (WIDTH // 2 - msg_surface.get_width() // 2, HEIGHT // 2 - 40))
             screen.blit(sub_surface, (WIDTH // 2 - sub_surface.get_width() // 2, HEIGHT // 2 - 10))
 
+        self.draw_benchmark_overlay()
         pygame.display.flip()
 
 
